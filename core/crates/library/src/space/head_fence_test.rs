@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::attribution::CommitAttribution;
 use crate::git::GitEngine;
 
-use super::head_fence::HeadFence;
+use super::HeadFence;
 
 const PG_CON: &str = "postgres://user:password@localhost:5432/drua";
 
