@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use obix::out::{EphemeralEventType, Outbox};
@@ -119,8 +120,13 @@ impl HeadFence {
         };
 
         if self.local_contains(&required_head).await? {
+            tracing::trace!(%required_head, "library head fence satisfied locally");
             return Ok(());
         }
+
+        // A missing fenced object is the ordinary stale-replica case, not an
+        // error. Refresh synchronously before serving any Git-backed data.
+        tracing::debug!(%required_head, "library head fence requires synchronous refresh");
 
         // The fence is durable and is published only after a successful push.
         // If origin is temporarily unreachable, fail the read rather than serve
@@ -136,15 +142,20 @@ impl HeadFence {
         // commit. Re-check the actual local graph and fail closed if the fence
         // is still not satisfied.
         if self.local_contains(&required_head).await? {
+            tracing::debug!(%required_head, "library head fence satisfied after refresh");
             return Ok(());
         }
 
+        tracing::warn!(%required_head, "library head fence unsatisfied after refresh");
         return Err(SpaceError::Git(format!(
             "library head fence {required_head} is not reachable after refreshing origin"
         )));
     }
 
     async fn required_head(&self) -> Result<Option<String>, SpaceError> {
+        // `ephemeral_outbox_events.event_type` is UNIQUE and obix publishes
+        // ephemeral events with ON CONFLICT(event_type) DO UPDATE, so this is a
+        // single durable register. No ordering clause is needed or meaningful.
         let payload = sqlx::query_scalar::<_, Json<LibraryHeadFence>>(
             "SELECT payload FROM ephemeral_outbox_events WHERE event_type = $1",
         )
@@ -159,30 +170,147 @@ impl HeadFence {
         let repo_path = self.git.repo_path().to_path_buf();
         let required_head = required_head.to_string();
 
-        return tokio::task::spawn_blocking(move || -> Result<bool, SpaceError> {
-            let repo = git2::Repository::open_bare(&repo_path)
-                .map_err(|e| SpaceError::Git(format!("open bare: {e}")))?;
-            let required_oid = git2::Oid::from_str(&required_head)
-                .map_err(|e| SpaceError::Git(format!("parse required head {required_head}: {e}")))?;
-            let local_oid = match repo.head().ok().and_then(|head| head.target()) {
-                Some(oid) => oid,
-                None => return Ok(false),
-            };
-
-            if local_oid == required_oid {
-                return Ok(true);
-            }
-
-            if repo.find_commit(required_oid).is_err() {
-                return Ok(false);
-            }
-
-            let contains = repo
-                .graph_descendant_of(local_oid, required_oid)
-                .map_err(|e| SpaceError::Git(format!("compare local head to fence: {e}")))?;
-            return Ok(contains);
+        return tokio::task::spawn_blocking(move || {
+            return repo_contains_required_head(&repo_path, &required_head);
         })
         .await
         .map_err(|e| SpaceError::Git(format!("head fence join: {e}")))?;
+    }
+}
+
+/// Return whether the current local HEAD satisfies `required_head`.
+///
+/// The required object being absent is deliberately `Ok(false)`: that is the
+/// normal shape of a stale replica before it fetches the acknowledged write.
+/// Malformed fence OIDs and repository/graph failures remain hard errors.
+fn repo_contains_required_head(repo_path: &Path, required_head: &str) -> Result<bool, SpaceError> {
+    let repo = git2::Repository::open_bare(repo_path)
+        .map_err(|e| SpaceError::Git(format!("open bare: {e}")))?;
+    let required_oid = git2::Oid::from_str(required_head)
+        .map_err(|e| SpaceError::Git(format!("parse required head {required_head}: {e}")))?;
+    let local_oid = match repo.head().ok().and_then(|head| head.target()) {
+        Some(oid) => oid,
+        None => return Ok(false),
+    };
+
+    if local_oid == required_oid {
+        return Ok(true);
+    }
+
+    if repo.find_commit(required_oid).is_err() {
+        return Ok(false);
+    }
+
+    return repo
+        .graph_descendant_of(local_oid, required_oid)
+        .map_err(|e| SpaceError::Git(format!("compare local head to fence: {e}")));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repo_contains_required_head;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "drua-head-fence-{name}-{}-{nonce}.git",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        return path;
+    }
+
+    fn commit_file(
+        repo: &git2::Repository,
+        parent: Option<git2::Oid>,
+        message: &str,
+        content: &str,
+    ) -> git2::Oid {
+        let blob = repo.blob(content.as_bytes()).expect("blob");
+        let mut builder = repo.treebuilder(None).expect("tree builder");
+        builder
+            .insert("doc.txt", blob, 0o100644)
+            .expect("insert blob");
+        let tree_oid = builder.write().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let signature = git2::Signature::now("Drua Test", "drua-test@example.com")
+            .expect("signature");
+
+        let oid = match parent {
+            Some(parent_oid) => {
+                let parent = repo.find_commit(parent_oid).expect("find parent");
+                repo.commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    message,
+                    &tree,
+                    &[&parent],
+                )
+                .expect("commit with parent")
+            }
+            None => repo
+                .commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    message,
+                    &tree,
+                    &[],
+                )
+                .expect("initial commit"),
+        };
+        repo.set_head("refs/heads/main").expect("set HEAD");
+        return oid;
+    }
+
+    #[test]
+    fn missing_required_commit_is_a_refreshable_behind_state() {
+        let path = scratch("missing");
+        let repo = git2::Repository::init_bare(&path).expect("init bare");
+        commit_file(&repo, None, "initial", "old\n");
+
+        let absent = "1111111111111111111111111111111111111111";
+        let contains = repo_contains_required_head(&path, absent).expect("compare");
+        assert!(!contains, "an object absent from the clone must trigger refresh");
+
+        drop(repo);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn descendant_head_satisfies_the_fence() {
+        let path = scratch("descendant");
+        let repo = git2::Repository::init_bare(&path).expect("init bare");
+        let fenced = commit_file(&repo, None, "fenced", "one\n");
+        commit_file(&repo, Some(fenced), "newer", "two\n");
+
+        let contains = repo_contains_required_head(&path, &fenced.to_string()).expect("compare");
+        assert!(contains, "a descendant must satisfy an older acknowledged fence");
+
+        drop(repo);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn divergent_head_does_not_satisfy_the_fence() {
+        let path = scratch("divergent");
+        let repo = git2::Repository::init_bare(&path).expect("init bare");
+        let base = commit_file(&repo, None, "base", "base\n");
+        let fenced = commit_file(&repo, Some(base), "fenced", "fenced\n");
+
+        repo.reference("refs/heads/main", base, true, "rewind for divergent test")
+            .expect("rewind main");
+        repo.set_head("refs/heads/main").expect("set HEAD");
+        commit_file(&repo, Some(base), "divergent", "other\n");
+
+        let contains = repo_contains_required_head(&path, &fenced.to_string()).expect("compare");
+        assert!(!contains, "a divergent force-pushed head must fail closed");
+
+        drop(repo);
+        let _ = std::fs::remove_dir_all(path);
     }
 }
