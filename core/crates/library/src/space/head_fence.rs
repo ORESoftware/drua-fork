@@ -314,3 +314,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 }
+
+#[cfg(test)]
+#[path = "head_fence_test.rs"]
+mod head_fence_test;
